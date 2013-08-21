@@ -343,8 +343,8 @@ class SCLmodel():
 		
 		
 		#make sure W has unit-length columns
-		#new_W=updates[self.W]
-		#updates[self.W]=T.cast(new_W/T.sqrt(T.sum(new_W**2,axis=0)),'float32')
+		new_W=updates[self.W]
+		updates[self.W]=T.cast(new_W/T.sqrt(T.sum(new_W**2,axis=0)),'float32')
 		
 		#MIGHT NEED TO NORMALIZE A
 		

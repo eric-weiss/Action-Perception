@@ -17,7 +17,7 @@ def pink_noise(nsamps,ampbase,cutoff):
 	return out*ampbase
 
 
-nm=3
+nm=2
 nd=2
 nt=2000
 
@@ -25,9 +25,11 @@ nt=2000
 
 #init_pos[:,1]+=0.01
 
-init_pos=np.asarray([[0,0],[0,4],[.02,8]],dtype='float32')
+#init_pos=np.asarray([[0,0],[0,4],[.02,8]],dtype='float32')
+init_pos=np.asarray([[0,0],[0.1,-4]],dtype='float32')
 
-linsprings=[[2000.0,4.0,0,1],[2000.0,4.0,1,2]]
+#linsprings=[[2000.0,4.0,0,1],[2000.0,4.0,1,2]]
+linsprings=[[2000.0,4.0,0,1]]
 
 model=world(init_pos,linsprings)
 
@@ -41,9 +43,14 @@ a=np.zeros((nt,7))
 #thrust=np.asarray([np.sin(thrust),np.cos(thrust)])
 #thrust=thrust.T
 
-thrust=np.ones((2,nt))*0
+thrust=np.ones((1,nt))*0
 thrust[0,:]=0.0
 thrust=thrust.T
+
+thrust=np.reshape(pink_noise(nt,0.8,20.0),(nt,1))
+
+pp.plot(thrust)
+pp.show()
 
 ph=np.zeros((nt,nm,nd))
 vh=np.zeros((nt,nm,nd))
@@ -57,7 +64,7 @@ for i in range(nt):
 	#sh[i]=s
 	#model.change_params([[0, a[i,0]],[1, a[i,1]], [2, a[i,2]], [3, a[i,3]], [4, a[i,4]], [5, a[i,5]], [6, a[i,6]]])
 	
-	ph[i]=model.pos
+	ph[i]=model.pos[1]
 	vh[i]=model.vel
 
 pp.plot(ph[:,:,0])
@@ -65,6 +72,4 @@ pp.show()
 
 double_pendulum_world.animate_hist(ph)
 
-f=open('tdata.cpl','wb')
-cp.dump(ph,f,2)
-f.close()
+

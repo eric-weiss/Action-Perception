@@ -56,7 +56,9 @@ class springworld:
 			ff=(dvec/dist)*(fs-fd)
 			
 			ftot[i]+=ff; ftot[j]-=ff+ft
-			
+		
+		#drag
+		ftot-=0.1*self.vel	
 		
 		#gravity
 		ftot[:,1]-=self.G
