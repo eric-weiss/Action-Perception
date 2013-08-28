@@ -7,7 +7,8 @@ class springworld:
 	
 	
 	def __init__(self, init_pos, linsprings, init_vel=0.0, nd=2,
-						masses=1.0, dt=0.002, G=8.0, lin_damping=10.0):
+						masses=1.0, dt=0.002, G=8.0, lin_damping=10.0,
+						noise_var=0.01):
 		
 		#xpos, ypos: initial mass positions
 		#masses: masses of each point
@@ -26,6 +27,7 @@ class springworld:
 		self.dt=dt
 		self.G=G
 		self.lin_damping=lin_damping
+		self.noise_var=noise_var
 	
 	
 	def compute_forces(self, thrust=None):
@@ -62,6 +64,9 @@ class springworld:
 		
 		#gravity
 		ftot[:,1]-=self.G
+		
+		#noise
+		ftot=ftot+np.random.randn(self.nm, self.nd)*self.noise_var
 		
 		
 		

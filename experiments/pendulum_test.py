@@ -7,7 +7,7 @@ import sys
 sys.path.insert(0, '../SLmodel')
 sys.path.insert(0, '../simulators')
 
-from SCLmodel import SCLmodel
+from SLmodel_vec import SLmodel
 
 import double_pendulum_world
 from double_pendulum_world import springworld as sim
@@ -16,14 +16,14 @@ import math
 
 
 nx=2
-ns=2
-nh=10
-npcl=20
+ns=6
+nh=4
+npcl=40
 
 nsamps=10
 lrate=1e-4
 
-model=SCLmodel(nx, ns, nh, npcl, xvar=0.1)
+model=SLmodel(nx, ns, nh, npcl, xvar=0.1)
 
 
 x=T.fvector()
@@ -212,7 +212,7 @@ pp.plot(s_av)
 #pp.plot(spred)
 
 pp.figure(8)
-pp.plot(xpred,'r')
+pp.plot(xpred[:,0,:],'r')
 #pp.plot(xact,'b')
 
 

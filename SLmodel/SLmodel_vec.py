@@ -8,7 +8,7 @@ import theano.tensor as T
 
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 
-class SCLmodel():
+class SLmodel():
 	
 	#This class defines the switched constrained linear model, which was
 	#designed to eliminate state-space 'explosions' that can occur when
@@ -31,7 +31,7 @@ class SCLmodel():
 		init_c=np.asarray(np.zeros(nx),dtype='float32')
 		
 		#dynamical matrices
-		init_M=np.asarray(np.random.randn(nh,ns**2)/2.0,dtype='float32')
+		init_M=np.asarray(np.random.randn(ns,ns*nh)/2.0,dtype='float32')
 		
 		#state-variable variances
 		#(covariance matrix of state variable noise assumed to be diagonal)
@@ -55,8 +55,6 @@ class SCLmodel():
 		init_h_past[:,0]=1.0
 		init_weights_past=np.asarray(np.ones(npcl)/float(npcl),dtype='float32')
 		
-		
-		
 		self.W=theano.shared(init_W)
 		self.c=theano.shared(init_c)
 		self.M=theano.shared(init_M)
@@ -69,6 +67,8 @@ class SCLmodel():
 		self.exp_A=T.exp(self.A)
 		self.ln_Z_h=T.reshape(0.5*T.sum(self.A, axis=1), (nh,1))
 		
+		#this is to help vectorize operations
+		self.sum_mat=T.as_tensor_variable(np.asarray((np.tile(np.eye(ns),nh)).T,dtype='float32'))
 		
 		self.s_now=theano.shared(init_s_now)
 		self.h_now=theano.shared(init_h_now)
@@ -132,11 +132,6 @@ class SCLmodel():
 	
 	def calc_h_probs(self, s):
 		
-		#gterms, updates = theano.scan(fn=self.one_h_prob,
-									#outputs_info=[None],
-									#sequences=[self.exp_A, self.mu],
-									#non_sequences=[s],
-									#n_steps=self.nh)
 		#vectorized version
 		t1=T.dot(s*s,self.exp_A.T)
 		t2=-2.0*T.dot(s, (self.exp_A*self.mu).T)
@@ -167,11 +162,18 @@ class SCLmodel():
 		xpred=T.dot(self.W.T,(xp-self.c))/(2.0*self.xvar**2)
 		sig=(1.0/(self.b**2+1.0/(2.0*self.xvar**2)))/2.0
 		
-		[s_samps, s_pred, prop_terms], updates = theano.scan(fn=self.sample_proposal_s,
-										outputs_info=[None, None, None],
-										sequences=[self.s_now, self.h_now],
-										non_sequences=[xpred, sig],
-										n_steps=self.npcl)
+		
+		#vectorized version
+		s_pred=self.get_prediction(self.s_now, self.h_now)
+		
+		n=self.theano_rng.normal(size=T.shape(self.s_now))
+		mean=2.0*(xpred+s_pred*(self.b**2))*sig
+		
+		s_samps=mean+n*T.sqrt(sig)
+		
+		prop_terms=-T.sum(n**2,axis=1)/2.0
+		
+		updates={}
 		
 		#now that we have samples from the proposal distribution, we need to reweight them
 		
@@ -223,12 +225,10 @@ class SCLmodel():
 	
 	def get_prediction(self, s, h):
 		
-		M_vec=T.sum(self.M*T.reshape(h,(self.nh,1)),axis=0)
-		M=M_vec.reshape((self.ns,self.ns))
+		s_dot_M=T.dot(s, self.M)  #this is np by nh*ns
+		s_pred=T.dot(s_dot_M*T.extra_ops.repeat(h,self.ns,axis=1),self.sum_mat) #should be np by ns
 		
-		sp=T.dot(M, s)
-		
-		return T.cast(sp,'float32')
+		return T.cast(s_pred,'float32')
 	
 	
 	def sample_joint(self, sp):
@@ -306,10 +306,7 @@ class SCLmodel():
 		#this function samples from the joint posterior and performs
 		# a step of gradient ascent on the log-likelihood
 		
-		sp, updates = theano.scan(fn=self.get_prediction,
-									outputs_info=[None],
-									sequences=[self.s_past, self.h_past],
-									n_steps=self.npcl)
+		sp=self.get_prediction(self.s_past, self.h_past)
 									
 		#sp should be np by ns
 		
@@ -324,10 +321,7 @@ class SCLmodel():
 		x1_recons=T.dot(self.W, s1_samps.T) + T.reshape(self.c,(self.nx,1))
 		x2_recons=T.dot(self.W, s2_samps.T) + T.reshape(self.c,(self.nx,1))
 		
-		s_pred, updates = theano.scan(fn=self.get_prediction,
-									outputs_info=[None],
-									sequences=[s1_samps, h1_samps],
-									n_steps=n_samps)
+		s_pred = self.get_prediction(s1_samps, h1_samps)
 		
 		
 		hterm1=self.calc_mean_h_energy(s1_samps, h1_samps, n_samps)
@@ -392,15 +386,9 @@ class SCLmodel():
 		
 		h_samp=self.theano_rng.multinomial(pvals=T.reshape(h_probs,(1,self.nh)))
 		
-		M_vec=T.sum(self.M*T.reshape(h_samp,(self.nh,1)),axis=0)
+		sp=self.get_prediction(s,h_samp)
 		
-		#here I use the 'mean M' by combining the M's according to their probabilities
-		#M_vec=T.sum(self.M*T.reshape(hprobs,(self.nh,1)),axis=0)
-		M=M_vec.reshape((self.ns,self.ns))
-		
-		sp=T.dot(M, s)
-		
-		xp=T.dot(self.W, sp) + self.c
+		xp=T.dot(self.W, sp.T) + T.reshape(self.c,(self.nx,1))
 		
 		return T.cast(sp,'float32'), T.cast(xp,'float32'), h_samp
 		
@@ -408,6 +396,7 @@ class SCLmodel():
 	def simulate_forward(self, n_steps):
 		
 		s0=T.sum(self.s_now*T.reshape(self.weights_now,(self.npcl,1)),axis=0)
+		s0=T.reshape(s0,(1,self.ns))
 		[sp, xp, hs], updates = theano.scan(fn=self.simulate_step,
 										outputs_info=[s0, None, None],
 										n_steps=n_steps)
