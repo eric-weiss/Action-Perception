@@ -10,9 +10,8 @@ from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 
 class SLmodel():
 	
-	#This class defines the switched constrained linear model, which was
-	#designed to eliminate state-space 'explosions' that can occur when
-	#doing prediction - a serious issue in the basic SL model
+	#This is the vectorized SL model with conditional h energies being 
+	#defined as sAh + b_h'h. (so it is no longer like a mix of gaussians)
 	
 	def __init__(self, nx, ns, nh, npcl, xvar=1.0):
 		
@@ -26,7 +25,6 @@ class SLmodel():
 		#always normalize the columns of W to be unit length
 		init_W=init_W/np.sqrt(np.sum(init_W**2,axis=0))
 		
-		
 		#observed variable means
 		init_c=np.asarray(np.zeros(nx),dtype='float32')
 		
@@ -38,16 +36,11 @@ class SLmodel():
 		#(covariance matrix of state variable noise assumed to be diagonal)
 		init_b=np.asarray(np.ones(ns)*10.0,dtype='float32')
 		
-		#means for switching variable
-		init_mu=np.asarray(np.random.randn(nh,ns)/1.0,dtype='float32')
-		
-		#(natural log of) covariance matrices for switching variable
-		#I assume the covariance matrices to be diagonal, so I 
-		#store all the diagonal elements in a ns-by-nh matrix
-		init_A=np.asarray(np.zeros((nh,ns)),dtype='float32')
+		#Switching parameter matrix
+		init_A=np.asarray(np.zeros((ns,nh)),dtype='float32')
 		
 		#priors for switching variable
-		init_ph=np.asarray(np.random.randn(nh),dtype='float32')
+		init_ph=np.asarray(np.zeros(nh),dtype='float32')
 		
 		init_s_now=np.asarray(np.zeros((npcl,ns)),dtype='float32')
 		init_h_now=np.asarray(np.zeros((npcl,nh)),dtype='float32')
@@ -64,13 +57,7 @@ class SLmodel():
 		self.M=theano.shared(init_M)
 		self.b=theano.shared(init_b)
 		self.A=theano.shared(init_A)
-		self.mu=theano.shared(init_mu)
 		self.ph=theano.shared(init_ph)
-		
-		#I define thes to avoid repeated computations of the exponential
-		#of the elements of A and of the normalizing constants for each h
-		self.exp_A=T.exp(self.A)
-		self.ln_Z_h=T.reshape(0.5*T.sum(self.A, axis=1), (nh,1))
 		
 		#this is to help vectorize operations
 		self.sum_mat=T.as_tensor_variable(np.asarray((np.tile(np.eye(ns),nh)).T,dtype='float32'))
@@ -92,8 +79,8 @@ class SLmodel():
 		
 		self.theano_rng = RandomStreams()
 		
-		self.params=				[self.W, self.M, self.b, self.A, self.c, self.mu, self.ph]
-		self.rel_lrates=np.asarray([  1.0,    1.0,    0.01,   1.0,   1.0,    10.0,     1.0]   ,dtype='float32')
+		self.params=				[self.W, self.M, self.b, self.A, self.c, self.ph]
+		self.rel_lrates=np.asarray([  0.1,    1.0,    0.01,   1.0,    1.0,     1.0]   ,dtype='float32')
 	
 	
 	def sample_proposal_s(self, s, h, xpred, sig):
@@ -126,34 +113,19 @@ class SLmodel():
 		#return xr
 	
 	
-	def one_h_prob(self, exp_A_i, mu_i, s):
-		
-		#scan function for self.calc_h_probs
-		smi=s-mu_i   #should be np by ns
-		smia=smi*T.reshape(exp_A_i,(1,self.ns))
-		gaussian_term=-T.sum(smia*smi,axis=1)
-		return gaussian_term
-	
-	
 	def calc_h_probs(self, s):
 		
-		#vectorized version
-		t1=T.dot(s*s,self.exp_A.T)
-		t2=-2.0*T.dot(s, (self.exp_A*self.mu).T)
-		t3=T.sum((self.mu*self.mu)*self.exp_A,axis=1)
-		gterms=-0.5*(t1+t2+t3).T
+		#this function takes an np by ns matrix of s samples
+		#and returns an nh by np set of h probabilities
 		
-		#gterms should be nh by np
-		
-		#need to multiply by relative partition functions and probabilities
-		exp_terms=gterms+self.ln_Z_h+T.reshape(self.ph,(self.nh,1))
+		exp_terms=T.dot(s, self.A) + T.reshape(self.ph,(1,self.nh))
 		
 		#re-centering for numerical stability
-		exp_terms_recentered=exp_terms-T.max(exp_terms)
+		exp_terms_recentered=exp_terms-T.max(exp_terms,axis=1)
 		
 		#exponentiation and normalization
 		rel_probs=T.exp(exp_terms)
-		probs=rel_probs/T.sum(rel_probs, axis=0)
+		probs=rel_probs/T.reshape(T.sum(rel_probs, axis=1),(s.shape[0],1))
 		
 		return probs
 	
@@ -164,9 +136,9 @@ class SLmodel():
 		#need to sample from the proposal distribution first
 		
 		#these terms are the same for every particle
-		xpred=T.dot(self.W.T,(xp-self.c))/(2.0*self.xvar**2)
-		sig=(1.0/(self.b**2+1.0/(2.0*self.xvar**2)))/2.0
-		#sig=1.0/(self.b**2)
+		#xpred=T.dot(self.W.T,(xp-self.c))/(2.0*self.xvar**2)
+		#sig=(1.0/(self.b**2+1.0/(2.0*self.xvar**2)))/2.0
+		sig=1.0/(self.b**2)
 		
 		
 		#vectorized version
@@ -174,8 +146,8 @@ class SLmodel():
 		
 		n=self.theano_rng.normal(size=T.shape(self.s_now))
 		
-		mean=2.0*(xpred+s_pred*(self.b**2))*sig
-		#mean=s_pred  #trying out using solely predictive proposal distrib
+		#mean=2.0*(xpred+s_pred*(self.b**2))*sig
+		mean=s_pred  #trying out using solely predictive proposal distrib
 		
 		s_samps=mean+n*T.sqrt(sig)
 		
@@ -185,18 +157,9 @@ class SLmodel():
 		
 		#now that we have samples from the proposal distribution, we need to reweight them
 		
-		#would use this if we have multiple generative models
-		#recons, updates = theano.scan(fn=get_recon,
-										#outputs_info=[None],
-										#sequences=[s_samps, h_samps],
-										#n_steps=self.npcl)
-		
-		#this loops over every row of A and mu to calculate relative h probabilities
-		#for each particle
-		
 		h_probs = self.calc_h_probs(s_samps)
 		
-		h_samps=self.theano_rng.multinomial(pvals=h_probs.T)
+		h_samps=self.theano_rng.multinomial(pvals=h_probs)
 		
 		recons=T.dot(self.W, s_samps.T) + T.reshape(self.c,(self.nx,1))
 		
@@ -228,7 +191,8 @@ class SLmodel():
 		
 		#return normalizer, energies_recentered, s_samps, s_pred, T.dot(self.W.T,(xp-self.c)), updates
 		#return normalizer, energies_recentered, updates
-		return h_samps, updates
+		#return h_samps, updates
+		return updates
 		
 	
 	def get_prediction(self, s, h):
@@ -299,23 +263,11 @@ class SLmodel():
 		#you give this function a set of samples of s and h,
 		#it gives you the average energy of those samples
 		
-		#energies, updates = theano.scan(fn=self.h_energy_step,
-									#outputs_info=[None],
-									#sequences=[s, h],
-									#n_steps=nsamps)
-		
-		#vectorized
-		t1=T.dot(s*s,self.exp_A.T)
-		t2=-2.0*T.dot(s, (self.exp_A*self.mu).T)
-		t3=T.sum((self.mu*self.mu)*self.exp_A,axis=1)
-		gterms=-0.5*(t1+t2+t3).T
-		
 		#gterms should be nh by np
 		
-		#need to multiply by relative partition functions and probabilities
-		exp_terms=gterms+self.ln_Z_h+T.reshape(self.ph,(self.nh,1))
+		exp_terms=T.dot(s, self.A) + T.reshape(self.ph,(1,self.nh))  #np by nh
 		
-		energies=T.sum(h*(exp_terms.T),axis=1)  #should be np by 1
+		energies=T.sum(h*exp_terms,axis=1)  #should be np by 1
 		
 		energy=T.mean(energies)
 		
@@ -364,8 +316,8 @@ class SLmodel():
 		
 		
 		#make sure W has unit-length columns
-		#new_W=updates[self.W]
-		#updates[self.W]=T.cast(new_W/T.sqrt(T.sum(new_W**2,axis=0)),'float32')
+		new_W=updates[self.W]
+		updates[self.W]=T.cast(new_W/T.sqrt(T.sum(new_W**2,axis=0)),'float32')
 		
 		#MIGHT NEED TO NORMALIZE A
 		
@@ -402,11 +354,12 @@ class SLmodel():
 	
 	def simulate_step(self, s):
 		
-		
+		s=T.reshape(s,(1,self.ns))
 		#get h probabilities
 		h_probs = self.calc_h_probs(s)
 		
-		h_samp=self.theano_rng.multinomial(pvals=T.reshape(h_probs,(self.nh)))
+		#h_samp=self.theano_rng.multinomial(pvals=T.reshape(h_probs,(self.nh,1)))
+		h_samp=self.theano_rng.multinomial(pvals=h_probs)
 		
 		sp=self.get_prediction(s,h_samp)
 		
@@ -416,6 +369,7 @@ class SLmodel():
 		
 	
 	def simulate_forward(self, n_steps):
+		
 		
 		s0=T.sum(self.s_now*T.reshape(self.weights_now,(self.npcl,1)),axis=0)
 		s0=T.reshape(s0,(1,self.ns))
