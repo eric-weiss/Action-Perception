@@ -27,16 +27,18 @@ def pink_noise(nsamps,ampbase,cutoff):
 	return out*ampbase
 
 
-nx=2
+nx=4
 ns=2
 nh=2
-npcl=40
+npcl=20
 
-nsamps=10
+nsamps=5
 lrate=1e-4
 
 dt=0.05
-nt=100000
+nt=200000
+
+npred=1000
 
 #making some data
 
@@ -56,26 +58,39 @@ x_hist=[]
 	#x=np.copy(world.pos[1])
 	#x_hist.append(x)
 
-theta=0.1
+theta=0.2
 vec=np.ones(2)
 M1=np.asarray([[np.cos(theta),-np.sin(theta)],[np.sin(theta),np.cos(theta)]],dtype='float32')
 M2=np.asarray([[np.cos(theta/3.0),-np.sin(theta/3.0)],[np.sin(theta/3.0),np.cos(theta/3.0)]],dtype='float32')
-W=np.asarray(np.random.randn(2,2),dtype='float32')
-c=np.asarray(np.random.randn(2),dtype='float32')
+W=np.asarray(np.random.randn(nx,2),dtype='float32')
+c=np.asarray(np.random.randn(nx),dtype='float32')
 
 v_hist=[]
 v_hist.append(np.asarray([1.0,0.0]))
 
+
 for i in range(nt):
 	
 	vec=v_hist[i]
-	x_hist.append(np.dot(W,vec)+c+np.random.randn(2)/100.0)
+	x_hist.append(np.dot(W,vec)+c+np.random.randn(nx)/100.0)
 	if vec[0]>0.0:
 		M=M1
 	else:
 		M=M2
 	v_hist.append(np.dot(M,vec) + np.random.randn(2)/100.0)
 
+vec=v_hist[-1]
+xact=[]
+for i in range(npred):
+	
+	xact.append(np.dot(W,vec)+c+np.random.randn(nx)/100.0)
+	if vec[0]>0.0:
+		M=M1
+	else:
+		M=M2
+	vec=np.dot(M,vec) + np.random.randn(2)/100.0
+
+xact=np.asarray(xact)
 
 x_hist=np.asarray(x_hist,dtype='float32')
 
@@ -201,7 +216,7 @@ for i in range(nt-1):
 		break
 
 
-npred=1000
+
 
 spred, xpred, hsmps = predict(npred)
 #print spred.shape
@@ -262,7 +277,7 @@ pp.plot(h_av)
 
 pp.figure(8)
 pp.plot(xpred[:,:,0],'r')
-#pp.plot(xact,'b')
+pp.plot(xact,'b')
 
 
 

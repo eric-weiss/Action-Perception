@@ -80,7 +80,7 @@ class SLmodel():
 		self.theano_rng = RandomStreams()
 		
 		self.params=				[self.W, self.M, self.b, self.A, self.c, self.ph]
-		self.rel_lrates=np.asarray([  0.1,    1.0,    0.01,   1.0,    1.0,     1.0]   ,dtype='float32')
+		self.rel_lrates=np.asarray([  0.1,    1.0,    0.01,   10.0,    0.1,     1.0]   ,dtype='float32')
 	
 	
 	def sample_proposal_s(self, s, h, xpred, sig):
@@ -125,9 +125,9 @@ class SLmodel():
 		
 		#exponentiation and normalization
 		rel_probs=T.exp(exp_terms)
-		probs=rel_probs/T.reshape(T.sum(rel_probs, axis=1),(s.shape[0],1))
+		probs=rel_probs.T/T.sum(rel_probs, axis=1)
 		
-		return probs
+		return probs.T
 	
 		
 	
@@ -136,9 +136,10 @@ class SLmodel():
 		#need to sample from the proposal distribution first
 		
 		#these terms are the same for every particle
-		#xpred=T.dot(self.W.T,(xp-self.c))/(2.0*self.xvar**2)
-		#sig=(1.0/(self.b**2+1.0/(2.0*self.xvar**2)))/2.0
-		sig=1.0/(self.b**2)
+		xpred=T.dot(self.W.T,(xp-self.c))/(2.0*self.xvar**2)
+		sig=(1.0/(self.b**2+1.0/(2.0*self.xvar**2)))/2.0
+		
+		#sig=1.0/(self.b**2)
 		
 		
 		#vectorized version
@@ -146,8 +147,9 @@ class SLmodel():
 		
 		n=self.theano_rng.normal(size=T.shape(self.s_now))
 		
-		#mean=2.0*(xpred+s_pred*(self.b**2))*sig
-		mean=s_pred  #trying out using solely predictive proposal distrib
+		mean=2.0*(xpred+s_pred*(self.b**2))*sig
+		
+		#mean=s_pred  #trying out using solely predictive proposal distrib
 		
 		s_samps=mean+n*T.sqrt(sig)
 		
@@ -263,11 +265,10 @@ class SLmodel():
 		#you give this function a set of samples of s and h,
 		#it gives you the average energy of those samples
 		
-		#gterms should be nh by np
 		
 		exp_terms=T.dot(s, self.A) + T.reshape(self.ph,(1,self.nh))  #np by nh
 		
-		energies=T.sum(h*exp_terms,axis=1)  #should be np by 1
+		energies=T.sum(h*exp_terms,axis=1) - T.log(T.sum(T.exp(exp_terms),axis=1)) #should be np by 1
 		
 		energy=T.mean(energies)
 		
@@ -298,14 +299,15 @@ class SLmodel():
 		
 		
 		hterm1=self.calc_mean_h_energy(s1_samps, h1_samps)
-		hterm2=self.calc_mean_h_energy(s2_samps, h2_samps)
+		#hterm2=self.calc_mean_h_energy(s2_samps, h2_samps)
 		
 		sterm=-T.mean(T.sum((self.b*(s2_samps-s_pred))**2,axis=1))/2.0
 		
 		xterm1=-T.mean(T.sum((x1_recons-T.reshape(x1,(self.nx,1)))**2,axis=0)/(2.0*self.xvar**2))
 		xterm2=-T.mean(T.sum((x2_recons-T.reshape(x2,(self.nx,1)))**2,axis=0)/(2.0*self.xvar**2))
 		
-		energy = hterm1 + xterm1 + hterm2 + xterm2 + sterm
+		#energy = hterm1 + xterm1 + hterm2 + xterm2 + sterm -T.sum(T.sum(self.A**2))
+		energy = hterm1 + xterm1 + xterm2 + sterm -T.sum(T.sum(self.A**2))
 		
 		gparams=T.grad(energy, self.params, consider_constant=[s1_samps, s2_samps, h1_samps, h2_samps])
 		
@@ -316,8 +318,8 @@ class SLmodel():
 		
 		
 		#make sure W has unit-length columns
-		new_W=updates[self.W]
-		updates[self.W]=T.cast(new_W/T.sqrt(T.sum(new_W**2,axis=0)),'float32')
+		#new_W=updates[self.W]
+		#updates[self.W]=T.cast(new_W/T.sqrt(T.sum(new_W**2,axis=0)),'float32')
 		
 		#MIGHT NEED TO NORMALIZE A
 		
