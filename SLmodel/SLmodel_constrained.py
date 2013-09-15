@@ -8,38 +8,46 @@ import theano.tensor as T
 
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 
-class SLmodel():
+class SCLmodel():
 	
-	#This is the switched conditional linear model for integrating 
-	#action with sensation
+	#This class defines the switched constrained linear model, which was
+	#designed to eliminate state-space 'explosions' that can occur when
+	#doing prediction - a serious issue in the basic SL model
 	
-	def __init__(self, nx, ns, nh, na, npcl, xvar=1.0):
+	def __init__(self, nx, ns, nh, npcl, xvar=1.0):
 		
 		#for this model I assume one linear generative model and a 
 		#combination of nh linear dynamical models
 		
 		#generative matrix
 		init_W=np.asarray(np.random.randn(nx,ns)/10.0,dtype='float32')
+		#init_W=np.asarray(np.eye(2),dtype='float32')
+		
+		#always normalize the columns of W to be unit length
+		init_W=init_W/np.sqrt(np.sum(init_W**2,axis=0))
+		
 		
 		#observed variable means
 		init_c=np.asarray(np.zeros(nx),dtype='float32')
 		
 		#dynamical matrices
-		init_M=np.asarray((np.tile(np.eye(ns),(1,nh))),dtype='float32')  #for state-based predictions
-		init_C=np.asarray((np.tile(np.zeros((na,ns)),(1,nh))),dtype='float32')  #for action-based predictions
+		init_M=np.asarray(np.random.randn(nh,ns**2)/2.0,dtype='float32')
 		
 		#state-variable variances
 		#(covariance matrix of state variable noise assumed to be diagonal)
 		init_b=np.asarray(np.ones(ns)*10.0,dtype='float32')
 		
-		#Switching parameter matrices
-		init_A=np.asarray(np.zeros((ns,nh)),dtype='float32') #associated with the state
-		init_B=np.asarray(np.zeros((na,nh)),dtype='float32') #associated with actions
+		#means for switching variable
+		init_mu=np.asarray(np.random.randn(nh,ns)/1.0,dtype='float32')
 		
-		#priors for switching variable
-		init_ph=np.asarray(np.zeros(nh),dtype='float32')
+		#(natural log of) covariance matrices for switching variable
+		#I assume the covariance matrices to be diagonal, so I 
+		#store all the diagonal elements in a ns-by-nh matrix
+		init_A=np.asarray(np.zeros((nh,ns)),dtype='float32')
 		
 		init_s_now=np.asarray(np.zeros((npcl,ns)),dtype='float32')
+		init_h_now=np.asarray(np.zeros((npcl,nh)),dtype='float32')
+		init_h_now[:,0]=1.0
 		init_weights_now=np.asarray(np.ones(npcl)/float(npcl),dtype='float32')
 		
 		init_s_past=np.asarray(np.zeros((npcl,ns)),dtype='float32')
@@ -47,26 +55,27 @@ class SLmodel():
 		init_h_past[:,0]=1.0
 		init_weights_past=np.asarray(np.ones(npcl)/float(npcl),dtype='float32')
 		
-		init_a_past=np.asarray(np.zeros((1,na)),dtype='float32')
+		
 		
 		self.W=theano.shared(init_W)
 		self.c=theano.shared(init_c)
 		self.M=theano.shared(init_M)
-		self.C=theano.shared(init_C)
 		self.b=theano.shared(init_b)
 		self.A=theano.shared(init_A)
-		self.B=theano.shared(init_B)
-		self.ph=theano.shared(init_ph)
+		self.mu=theano.shared(init_mu)
 		
-		#this is to help vectorize operations
-		self.sum_mat=T.as_tensor_variable(np.asarray((np.tile(np.eye(ns),nh)).T,dtype='float32'))
+		#I define thes to avoid repeated computations of the exponential
+		#of the elements of A and of the normalizing constants for each h
+		self.exp_A=T.exp(self.A)
+		self.ln_Z_h=T.reshape(0.5*T.sum(self.A, axis=1), (nh,1))
+		
 		
 		self.s_now=theano.shared(init_s_now)
+		self.h_now=theano.shared(init_h_now)
 		self.weights_now=theano.shared(init_weights_now)
 		
 		self.s_past=theano.shared(init_s_past)
 		self.h_past=theano.shared(init_h_past)
-		self.a_past=theano.shared(init_a_past)
 		self.weights_past=theano.shared(init_weights_past)
 		
 		self.xvar=np.asarray(xvar,dtype='float32')
@@ -74,18 +83,17 @@ class SLmodel():
 		self.nx=nx		#dimensionality of observed variables
 		self.ns=ns		#dimensionality of latent variables
 		self.nh=nh		#number of (linear) dynamical modes
-		self.na=na		#dimensionality of action variables
 		self.npcl=npcl	#numer of particles in particle filter
 		
 		self.theano_rng = RandomStreams()
 		
-		self.params=				[self.W, self.M, self.C, self.b, self.A, self.B, self.c, self.ph]
-		self.rel_lrates=np.asarray([  0.1,    1.0,    1.0,    0.01,   10.0,    10.0,  0.1,     1.0]   ,dtype='float32')
+		self.params=				[self.W, self.M, self.b, self.A, self.c, self.mu]
+		self.rel_lrates=np.asarray([  1.0,    1.0,    0.01,   1.0,   1.0,    10.0]   ,dtype='float32')
 	
 	
-	def sample_proposal_s(self, s, a, h, xpred, sig):
+	def sample_proposal_s(self, s, h, xpred, sig):
 		
-		s_pred=self.get_prediction(s, a, h)
+		s_pred=self.get_prediction(s, h)
 		
 		n=self.theano_rng.normal(size=T.shape(s))
 		
@@ -113,60 +121,77 @@ class SLmodel():
 		#return xr
 	
 	
-	def calc_h_probs(self, s, a):
+	def one_h_prob(self, exp_A_i, mu_i, s):
 		
-		#this function takes an np by ns matrix of s samples plus
-		#an action vector a
-		#and returns an nh by np set of h probabilities
+		#scan function for self.calc_h_probs
+		smi=s-mu_i   #should be np by ns
+		smia=smi*T.reshape(exp_A_i,(1,self.ns))
+		gaussian_term=-T.sum(smia*smi,axis=1)
+		return gaussian_term
+	
+	
+	def calc_h_probs(self, s):
 		
-		exp_terms=T.dot(s, self.A)+ T.reshape(T.dot(a, self.B),(1,self.nh)) + T.reshape(self.ph,(1,self.nh))
+		#gterms, updates = theano.scan(fn=self.one_h_prob,
+									#outputs_info=[None],
+									#sequences=[self.exp_A, self.mu],
+									#non_sequences=[s],
+									#n_steps=self.nh)
+		#vectorized version
+		t1=T.dot(s*s,self.exp_A.T)
+		t2=-2.0*T.dot(s, (self.exp_A*self.mu).T)
+		t3=T.sum((self.mu*self.mu)*self.exp_A,axis=1)
+		gterms=(t1+t2+t3).T
+		
+		#gterms should be nh by np
+		
+		#need to multiply by relative partition functions
+		exp_terms=gterms+self.ln_Z_h
 		
 		#re-centering for numerical stability
-		exp_terms_recentered=exp_terms-T.max(exp_terms,axis=1)
+		exp_terms_recentered=exp_terms-T.max(exp_terms)
 		
 		#exponentiation and normalization
 		rel_probs=T.exp(exp_terms)
-		probs=rel_probs.T/T.sum(rel_probs, axis=1)
+		probs=rel_probs/T.sum(rel_probs, axis=0)
 		
-		return probs.T
+		return probs
 	
 		
 	
-	def forward_filter_step(self, a, xp):
+	def forward_filter_step(self, xp):
 		
-		#first sample from h given s and a
+		#need to sample from the proposal distribution first
 		
-		h_probs = self.calc_h_probs(self.s_now, a)
-		h_samps=self.theano_rng.multinomial(pvals=h_probs)
-		
-		#need to sample from the proposal distribution
 		#these terms are the same for every particle
 		xpred=T.dot(self.W.T,(xp-self.c))/(2.0*self.xvar**2)
 		sig=(1.0/(self.b**2+1.0/(2.0*self.xvar**2)))/2.0
 		
-		#sig=1.0/(self.b**2)
-		
-		#vectorized version
-		s_pred=self.get_prediction(self.s_now, a, h_samps)
-		
-		n=self.theano_rng.normal(size=T.shape(self.s_now))
-		
-		mean=2.0*(xpred+s_pred*(self.b**2))*sig
-		
-		#mean=s_pred  #trying out using solely predictive proposal distrib
-		
-		s_samps=mean+n*T.sqrt(sig)
-		
-		prop_terms=-T.sum(n**2,axis=1)/2.0
-		
-		updates={}
+		[s_samps, s_pred, prop_terms], updates = theano.scan(fn=self.sample_proposal_s,
+										outputs_info=[None, None, None],
+										sequences=[self.s_now, self.h_now],
+										non_sequences=[xpred, sig],
+										n_steps=self.npcl)
 		
 		#now that we have samples from the proposal distribution, we need to reweight them
+		
+		#would use this if we have multiple generative models
+		#recons, updates = theano.scan(fn=get_recon,
+										#outputs_info=[None],
+										#sequences=[s_samps, h_samps],
+										#n_steps=self.npcl)
+		
+		#this loops over every row of A and mu to calculate relative h probabilities
+		#for each particle
+		
+		h_probs = self.calc_h_probs(s_samps)
+		
+		h_samps=self.theano_rng.multinomial(pvals=h_probs.T)
 		
 		recons=T.dot(self.W, s_samps.T) + T.reshape(self.c,(self.nx,1))
 		
 		x_terms=-T.sum((recons-T.reshape(xp,(self.nx,1)))**2,axis=0)/(2.0*self.xvar**2)
-		s_terms=-T.sum(((s_samps-s_pred)*self.b)**2,axis=1)/2.0
+		s_terms=-T.sum(((s_samps-s_pred)*self.b)**2,axis=1)
 		
 		energies=x_terms+s_terms-prop_terms
 		
@@ -182,9 +207,10 @@ class SLmodel():
 		normalizer=T.sum(new_weights_unnorm)
 		new_weights=new_weights_unnorm/normalizer  #need to normalize new weights
 		
-		updates[self.h_past]=T.cast(h_samps,'float32')
+		updates[self.h_past]=T.cast(self.h_now,'float32')
 		updates[self.s_past]=T.cast(self.s_now,'float32')
-		updates[self.a_past]=T.cast(a,'float32')
+		
+		updates[self.h_now]=T.cast(h_samps,'float32')
 		updates[self.s_now]=T.cast(s_samps,'float32')
 		
 		updates[self.weights_past]=T.cast(self.weights_now,'float32')
@@ -192,18 +218,17 @@ class SLmodel():
 		
 		#return normalizer, energies_recentered, s_samps, s_pred, T.dot(self.W.T,(xp-self.c)), updates
 		#return normalizer, energies_recentered, updates
-		#return h_samps, updates
-		return updates
+		return h_samps, updates
 		
 	
-	def get_prediction(self, s, a, h):
+	def get_prediction(self, s, h):
 		
-		s_dot_M=T.dot(s, self.M)  #this is np by nh*ns
-		a_dot_C=T.dot(a, self.C)  #this is 1 by nh*ns
-		tot=s_dot_M+a_dot_C  #should be np by nh*ns
-		s_pred=T.dot(tot*T.extra_ops.repeat(h,self.ns,axis=1),self.sum_mat) #should be np by ns
+		M_vec=T.sum(self.M*T.reshape(h,(self.nh,1)),axis=0)
+		M=M_vec.reshape((self.ns,self.ns))
 		
-		return T.cast(s_pred,'float32')
+		sp=T.dot(M, s)
+		
+		return T.cast(sp,'float32')
 	
 	
 	def sample_joint(self, sp):
@@ -225,14 +250,51 @@ class SLmodel():
 		return [s1_samp, h1_samp, s2_samp, h2_samp]
 	
 	
-	def calc_mean_h_energy(self, s, a, h):
+	#def sample_posterior(self, n_samps):
 		
-		#you give this function a set of samples of s, a, and h,
+		
+		#sp, updates = theano.scan(fn=self.get_prediction,
+									#outputs_info=[None],
+									#sequences=[self.s_past, self.h_past],
+									#n_steps=self.npcl)
+		
+		##sp should be np by ns
+		
+		
+		#[s1_samps, h1_samps, s2_samps, h2_samps], updates = theano.scan(fn=self.sample_joint,
+									#outputs_info=[None, None, None, None],
+									#non_sequences=[sp],
+									#n_steps=n_samps)
+		
+		#return [s1_samps, h1_samps, s2_samps, h2_samps]
+	
+	
+	def h_energy_step(self, s, h):
+		
+		#helper function for self.calc_s_energy
+		
+		exp_A_i=T.reshape(T.sum(self.exp_A*T.reshape(h,(self.nh,1)),axis=0),(self.ns,1))
+		mu_i=T.reshape(T.sum(self.mu*T.reshape(h,(self.nh,1)),axis=0), (self.ns,1))
+		ln_Z_h_i=T.sum(self.ln_Z_h*T.reshape(h,(self.nh,1)))
+		diff=T.reshape(T.reshape(s,(self.ns,1))-mu_i,(self.ns,1))
+		diff_dot_exp_A_i=diff*exp_A_i
+		gterm=-T.sum(T.sum(diff_dot_exp_A_i*diff))
+		energy=gterm+ln_Z_h_i
+		
+		
+		return energy
+	
+	
+	def calc_mean_h_energy(self, s, h, nsamps):
+		
+		#you give this function a set of samples of s and h,
 		#it gives you the average energy of those samples
 		
-		exp_terms=T.dot(s, self.A)+ T.reshape(T.dot(a, self.B),(1,self.nh)) + T.reshape(self.ph,(1,self.nh))  #np by nh
+		energies, updates = theano.scan(fn=self.h_energy_step,
+									outputs_info=[None],
+									sequences=[s, h],
+									n_steps=nsamps)
 		
-		energies=T.sum(h*exp_terms,axis=1) - T.log(T.sum(T.exp(exp_terms),axis=1)) #should be np by 1
 		
 		energy=T.mean(energies)
 		
@@ -244,7 +306,10 @@ class SLmodel():
 		#this function samples from the joint posterior and performs
 		# a step of gradient ascent on the log-likelihood
 		
-		sp=self.get_prediction(self.s_past, self.a_past, self.h_past)
+		sp, updates = theano.scan(fn=self.get_prediction,
+									outputs_info=[None],
+									sequences=[self.s_past, self.h_past],
+									n_steps=self.npcl)
 									
 		#sp should be np by ns
 		
@@ -259,19 +324,21 @@ class SLmodel():
 		x1_recons=T.dot(self.W, s1_samps.T) + T.reshape(self.c,(self.nx,1))
 		x2_recons=T.dot(self.W, s2_samps.T) + T.reshape(self.c,(self.nx,1))
 		
-		s_pred = self.get_prediction(s1_samps, h1_samps)
+		s_pred, updates = theano.scan(fn=self.get_prediction,
+									outputs_info=[None],
+									sequences=[s1_samps, h1_samps],
+									n_steps=n_samps)
 		
 		
-		hterm1=self.calc_mean_h_energy(s1_samps, h1_samps)
-		#hterm2=self.calc_mean_h_energy(s2_samps, h2_samps)
+		hterm1=self.calc_mean_h_energy(s1_samps, h1_samps, n_samps)
+		hterm2=self.calc_mean_h_energy(s2_samps, h2_samps, n_samps)
 		
-		sterm=-T.mean(T.sum((self.b*(s2_samps-s_pred))**2,axis=1))/2.0
+		sterm=-T.mean(T.sum((self.b*(s2_samps-s_pred))**2,axis=1))
 		
 		xterm1=-T.mean(T.sum((x1_recons-T.reshape(x1,(self.nx,1)))**2,axis=0)/(2.0*self.xvar**2))
 		xterm2=-T.mean(T.sum((x2_recons-T.reshape(x2,(self.nx,1)))**2,axis=0)/(2.0*self.xvar**2))
 		
-		#energy = hterm1 + xterm1 + hterm2 + xterm2 + sterm -T.sum(T.sum(self.A**2))
-		energy = hterm1 + xterm1 + xterm2 + sterm 
+		energy = hterm1 + xterm1 + hterm2 + xterm2 + sterm
 		
 		gparams=T.grad(energy, self.params, consider_constant=[s1_samps, s2_samps, h1_samps, h2_samps])
 		
@@ -318,30 +385,31 @@ class SLmodel():
 		return updates
 	
 	
-	def simulate_step(self, s, a):
+	def simulate_step(self, s):
 		
-		s=T.reshape(s,(1,self.ns))
-		a=T.reshape(a,(1,self.na))
 		#get h probabilities
-		h_probs = self.calc_h_probs(s,a)
-		h_samp=self.theano_rng.multinomial(pvals=h_probs)
+		h_probs = self.calc_h_probs(s)
 		
-		sp=self.get_prediction(s,a,h_samp)
+		h_samp=self.theano_rng.multinomial(pvals=T.reshape(h_probs,(1,self.nh)))
 		
-		xp=T.dot(self.W, sp.T) + T.reshape(self.c,(self.nx,1))
+		M_vec=T.sum(self.M*T.reshape(h_samp,(self.nh,1)),axis=0)
+		
+		#here I use the 'mean M' by combining the M's according to their probabilities
+		#M_vec=T.sum(self.M*T.reshape(hprobs,(self.nh,1)),axis=0)
+		M=M_vec.reshape((self.ns,self.ns))
+		
+		sp=T.dot(M, s)
+		
+		xp=T.dot(self.W, sp) + self.c
 		
 		return T.cast(sp,'float32'), T.cast(xp,'float32'), h_samp
 		
 	
-	def simulate_forward(self, a, n_steps):
-		
-		#a should be n_steps by na
+	def simulate_forward(self, n_steps):
 		
 		s0=T.sum(self.s_now*T.reshape(self.weights_now,(self.npcl,1)),axis=0)
-		s0=T.reshape(s0,(1,self.ns))
 		[sp, xp, hs], updates = theano.scan(fn=self.simulate_step,
 										outputs_info=[s0, None, None],
-										sequences=[a],
 										n_steps=n_steps)
 		
 		return sp, xp, hs, updates

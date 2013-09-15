@@ -7,7 +7,7 @@ import sys
 sys.path.insert(0, '../SLmodel')
 sys.path.insert(0, '../simulators')
 
-from SLmodel_2 import SLmodel
+from SLmodel_adaptive_prop import SLmodel
 
 import double_pendulum_world
 from double_pendulum_world import springworld as sim
@@ -27,9 +27,9 @@ def pink_noise(nsamps,ampbase,cutoff):
 	return out*ampbase
 
 
-nx=2
-ns=4
-nh=4
+nx=4
+ns=2
+nh=2
 npcl=20
 
 nsamps=5
@@ -44,30 +44,37 @@ npred=1000
 
 x_hist=[]
 
-init_pos=np.asarray([[0,0],[0.1,4]],dtype='float32')
-linsprings=[[2000.0,4.0,0,1]]
-world=sim(init_pos,linsprings)
+theta=0.2
+vec=np.ones(2)
+M1=np.asarray([[np.cos(theta),-np.sin(theta)],[np.sin(theta),np.cos(theta)]],dtype='float32')
+M2=np.asarray([[np.cos(theta/3.0),-np.sin(theta/3.0)],[np.sin(theta/3.0),np.cos(theta/3.0)]],dtype='float32')
+W=np.asarray(np.random.randn(nx,2),dtype='float32')
+c=np.asarray(np.random.randn(nx),dtype='float32')
 
-thrust=np.reshape(pink_noise(nt,0.8,20.0),(nt,1))
+v_hist=[]
+v_hist.append(np.asarray([1.0,0.0]))
 
-pp.plot(thrust)
-pp.show()
 
-#making the training data
 for i in range(nt):
-	world.sim_dynamics(20,thrust[i])
-	x=np.copy(world.pos[1])
-	x_hist.append(x)
-	if i==5000:
-		pp.plot(np.asarray(x_hist))
-		pp.show()
+	
+	vec=v_hist[i]
+	x_hist.append(np.dot(W,vec)+c+np.random.randn(nx)/100.0)
+	if vec[0]>0.0:
+		M=M1
+	else:
+		M=M2
+	v_hist.append(np.dot(M,vec) + np.random.randn(2)/100.0)
 
-#making some test data to compare against predictions
+vec=v_hist[-1]
 xact=[]
 for i in range(npred):
-	world.sim_dynamics(40,thrust[i])
-	x=np.copy(world.pos[1])
-	xact.append(x)
+	
+	xact.append(np.dot(W,vec)+c+np.random.randn(nx)/100.0)
+	if vec[0]>0.0:
+		M=M1
+	else:
+		M=M2
+	vec=np.dot(M,vec) + np.random.randn(2)/100.0
 
 xact=np.asarray(xact)
 
@@ -171,12 +178,26 @@ for i in range(nt-1):
 		#print normalizer
 		print ESS
 		print i
+		print 
+		print 'M'
 		print model.M.get_value()
+		print 'W'
 		print model.W.get_value()
+		print 'A'
 		print model.A.get_value()
+		print 'ph'
 		print model.ph.get_value()
+		print 'c'
 		print model.c.get_value()
+		print 'b'
 		print model.b.get_value()
+		print '\n Metaparameters:'
+		print 'D'
+		print model.D.get_value()
+		print 'E'
+		print model.E.get_value()
+		print 'sig'
+		print model.sig.get_value()
 	if ESS<npcl/2:
 		resample()
 		resample_counter=0
