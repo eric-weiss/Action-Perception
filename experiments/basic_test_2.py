@@ -7,7 +7,7 @@ import sys
 sys.path.insert(0, '../SLmodel')
 sys.path.insert(0, '../simulators')
 
-from SLmodel_adaptive_prop import SLmodel
+from SLmodel_adaptive_prop_2 import SLmodel
 
 import double_pendulum_world
 from double_pendulum_world import springworld as sim
@@ -29,8 +29,8 @@ def pink_noise(nsamps,ampbase,cutoff):
 
 nx=4
 ns=2
-nh=2
-npcl=80
+nh=3
+npcl=20
 
 nsamps=5
 lrate=1e-4
@@ -49,7 +49,7 @@ vec=np.ones(2)
 M1=np.asarray([[np.cos(theta),-np.sin(theta)],[np.sin(theta),np.cos(theta)]],dtype='float32')
 M2=np.asarray([[np.cos(theta/3.0),-np.sin(theta/3.0)],[np.sin(theta/3.0),np.cos(theta/3.0)]],dtype='float32')
 W=np.asarray(np.random.randn(nx,2),dtype='float32')
-c=np.asarray(np.random.randn(nx),dtype='float32')
+c=np.asarray(np.random.randn(nx)*1.0,dtype='float32')
 
 v_hist=[]
 v_hist.append(np.asarray([1.0,0.0]))
@@ -85,7 +85,9 @@ pp.show()
 
 xdata=theano.shared(x_hist)
 
-model=SLmodel(nx, ns, nh, npcl, xvar=0.1)
+xvar=0.1
+
+model=SLmodel(nx, ns, nh, npcl, xvar=xvar)
 
 idx=T.lscalar()
 x1=T.fvector()
@@ -119,7 +121,7 @@ lr=T.fscalar(); nsmps=T.lscalar()
 nrg, updates2 = model.update_params(x1, x2, nsmps, lr)
 learn_step=theano.function([idx,nsmps,lr],[nrg],
 							updates=updates2,
-							givens={x1: xdata[idx,:], x2: xdata[idx+1,:]},
+							givens={x1: xdata[idx-1,:], x2: xdata[idx,:]},
 							allow_input_downcast=True)
 
 nps=T.lscalar()
@@ -127,17 +129,24 @@ sps, xps, hs, updates3 = model.simulate_forward(nps)
 predict=theano.function([nps],[sps,xps,hs],updates=updates3,allow_input_downcast=True)
 
 
-
+plr=T.fscalar()
+pnsteps=T.lscalar()
+ploss, updates4 = model.update_proposal_distrib(pnsteps,plr)
+update_prop=theano.function([pnsteps, plr],ploss,updates=updates4,
+							allow_input_downcast=True,
+							on_unused_input='ignore')
 
 
 
 h_hist=[]
 
 e_hist=[]
+ess_hist=[]
 s_hist=[]
 r_hist=[]
 l_hist=[]
 w_hist=[]
+ploss_hist=[]
 
 th=[]
 
@@ -160,8 +169,12 @@ for i in range(nt-1):
 	
 	#print h_samps
 	
-	ESS=get_ESS()
+	if i%5==0:
+		pl=update_prop(4,1e-3)
+		ploss_hist.append(pl)
 	
+	ESS=get_ESS()
+	ess_hist.append(ESS)
 	learn_counter+=1
 	resample_counter+=1
 	
@@ -176,9 +189,10 @@ for i in range(nt-1):
 	
 	if i%1000==0:	
 		#print normalizer
-		print ESS
-		print i
-		print 
+		
+		print 'Iteration ', i, ' ================================'
+		print 'ESS: ', ESS
+		print '\nParameters'
 		print 'M'
 		print model.M.get_value()
 		print 'W'
@@ -191,13 +205,15 @@ for i in range(nt-1):
 		print model.c.get_value()
 		print 'b'
 		print model.b.get_value()
-		print '\n Metaparameters:'
-		print 'D'
-		print model.D.get_value()
-		print 'E'
-		print model.E.get_value()
-		print 'sig'
-		print model.sig.get_value()
+		print '\nMetaparameters:'
+		print 'Proposal loss: ', ploss_hist[-1]
+		print 'CCT-dot-true inverse covariance'
+		W=model.W.get_value()
+		b=model.b.get_value()
+		C=model.C.get_value()
+		cov_inv=np.dot(np.dot(C,C.T), np.dot(W.T, W)/(xvar**2)+np.eye(ns)*np.exp(-b))
+		print cov_inv
+		
 	if ESS<npcl/2:
 		resample()
 		resample_counter=0
@@ -210,9 +226,14 @@ for i in range(nt-1):
 	h_hist.append(model.h_now.get_value())
 	
 	if math.isnan(ESS):
-		print model.b.get_value()
-		print model.M.get_value()
-		print model.W.get_value()
+		print '\nSAMPLING ERROR===================\n'
+		print 'Proposal loss: ', ploss_hist[-1]
+		print 'CCT-dot-true inverse covariance'
+		W=model.W.get_value()
+		b=model.b.get_value()
+		C=model.C.get_value()
+		cov_inv=np.dot(np.dot(C,C.T), np.dot(W.T, W)/(xvar**2)+np.eye(ns)*np.exp(-b))
+		print cov_inv
 		break
 
 
@@ -229,6 +250,7 @@ spred, xpred, hsmps = predict(npred)
 s_hist=np.asarray(s_hist)
 w_hist=np.asarray(w_hist)
 h_hist=np.asarray(h_hist)
+ess_hist=np.asarray(ess_hist)
 s_av=np.mean(s_hist,axis=1)
 
 
@@ -253,6 +275,9 @@ pp.figure(4)
 pp.plot(s_av)
 #pp.plot(r_hist, 'r')
 #pp.plot(l_hist, 'k')
+
+pp.figure(5)
+pp.plot(ess_hist)
 
 #pp.figure(5)
 #for i in range(npcl):
@@ -279,7 +304,9 @@ pp.figure(8)
 pp.plot(xpred[:,:,0],'r')
 pp.plot(xact,'b')
 
-
+ploss_hist=np.asarray(ploss_hist)
+pp.figure(9)
+pp.plot(ploss_hist)
 
 #pp.figure(6)
 #for i in range(npcl):

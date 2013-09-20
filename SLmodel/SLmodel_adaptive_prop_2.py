@@ -1,6 +1,8 @@
 import numpy as np
 from matplotlib import pyplot as pp
 
+import scipy.linalg as spla
+
 import math
 
 import theano
@@ -10,8 +12,9 @@ from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 
 class SLmodel():
 	
-	#This is a test of my idea to adapt the proposal distribution by 
-	#maximizing the entropy of the weights
+	#This version adapts the proposal distribution by keeping a running
+	#estimate of the exact posterior covariance, parametrized as the 
+	#matrix CC'
 	
 	def __init__(self, nx, ns, nh, npcl, xvar=1.0):
 		
@@ -42,12 +45,19 @@ class SLmodel():
 		#priors for switching variable
 		init_ph=np.asarray(np.zeros(nh),dtype='float32')
 		
+		self.W=theano.shared(init_W)
+		self.c=theano.shared(init_c)
+		self.M=theano.shared(init_M)
+		self.b=theano.shared(init_b)
+		self.A=theano.shared(init_A)
+		self.ph=theano.shared(init_ph)
 		
-		#parameters for proposal distribution
-		init_D=np.asarray(np.eye(ns),dtype='float32')
-		init_E=np.asarray(np.random.randn(nx,ns)/100.0,dtype='float32')
-		init_k=np.asarray(np.zeros(ns),dtype='float32')
-		init_sig=np.asarray(np.ones(ns),dtype='float32')
+		#square root of covariance matrix of proposal distribution
+		#initialized to the true root covariance
+		init_cov_inv=np.dot(init_W.T, init_W)/(xvar**2) + np.eye(ns)*np.exp(-init_b)
+		init_cov=spla.inv(init_cov_inv)
+		init_C=spla.sqrtm(init_cov)
+		init_C=np.asarray(np.real(init_C),dtype='float32')
 		
 		
 		init_s_now=np.asarray(np.zeros((npcl,ns)),dtype='float32')
@@ -60,17 +70,9 @@ class SLmodel():
 		init_h_past[:,0]=1.0
 		init_weights_past=np.asarray(np.ones(npcl)/float(npcl),dtype='float32')
 		
-		self.W=theano.shared(init_W)
-		self.c=theano.shared(init_c)
-		self.M=theano.shared(init_M)
-		self.b=theano.shared(init_b)
-		self.A=theano.shared(init_A)
-		self.ph=theano.shared(init_ph)
 		
-		self.D=theano.shared(init_D)
-		self.E=theano.shared(init_E)
-		self.k=theano.shared(init_k)
-		self.sig=theano.shared(init_sig)
+		
+		self.C=theano.shared(init_C)
 		
 		#this is to help vectorize operations
 		self.sum_mat=T.as_tensor_variable(np.asarray((np.tile(np.eye(ns),nh)).T,dtype='float32'))
@@ -90,13 +92,19 @@ class SLmodel():
 		self.nh=nh		#number of (linear) dynamical modes
 		self.npcl=npcl	#numer of particles in particle filter
 		
+		
+		#for ease of use and efficient computation (these are used a lot)
+		self.CCT=T.dot(self.C, self.C.T)
+		self.cov_inv=T.dot(self.W.T, self.W)/(self.xvar**2) + T.eye(ns)*T.exp(-self.b)
+		
+		
 		self.theano_rng = RandomStreams()
 		
 		self.params=				[self.W, self.M, self.b, self.A, self.c, self.ph]
-		self.rel_lrates=np.asarray([  0.1,    1.0,    0.01,   10.0,    0.1,     1.0]   ,dtype='float32')
+		self.rel_lrates=np.asarray([  0.1,    1.0,    1.0,   10.0,    1.0,     1.0]   ,dtype='float32')
 		
-		self.meta_params=     [self.D, self.E, self.k, self.sig]
-		self.meta_rel_lrates=[   1.0,   1.0,     1.0,     1.0  ]
+		self.meta_params=     [self.C]
+		self.meta_rel_lrates=[   1.0  ]
 	
 	
 	def sample_proposal_s(self, s, h, xp):
@@ -105,9 +113,10 @@ class SLmodel():
 		
 		n=self.theano_rng.normal(size=T.shape(s))
 		
-		prop_mean=T.dot(s_pred, self.D) + T.reshape(T.dot(xp, self.E),(1,self.ns)) + self.k
+		mean_term=T.dot((xp-self.c), self.W)/(self.xvar**2) + s_pred*T.exp(-self.b)
+		prop_mean=T.dot(mean_term, self.CCT)
 		
-		s_prop=prop_mean + n*T.reshape(T.exp(self.sig/2.0),(1,self.ns))
+		s_prop=prop_mean + T.dot(n, self.C)
 		
 		#I compute the term inside the exponent for the pdf of the proposal distrib
 		prop_term=-T.sum(n**2)/2.0
@@ -130,24 +139,6 @@ class SLmodel():
 		probs=rel_probs.T/T.sum(rel_probs, axis=1)
 		
 		return probs.T
-	
-	
-	def proposal_loss(self, s_pred, s_samps, xp, weights):
-		
-		#estimates the KL divergence between the proposal distribution
-		#and the true posterior (minus one term, which we assume does not
-		#depend on the proposal distribution).
-		
-		#prop means should be symblolic variables since we need to 
-		#compute the derivatives of D and E through this function
-		
-		prop_means=T.dot(s_pred, self.D) + T.reshape(T.dot(xp, self.E),(1,self.ns)) + self.k  #np by ns
-		
-		diffs=(prop_means-s_samps)
-		scl_diffs=diffs*T.reshape(T.exp(-self.sig),(1,self.ns))
-		energies=0.5*T.sum(diffs*scl_diffs,axis=1)
-		tot=T.sum(energies*weights)+0.5*T.sum(self.sig)
-		return tot
 	
 	
 	def forward_filter_step(self, xp):
@@ -182,18 +173,6 @@ class SLmodel():
 		normalizer=T.sum(new_weights_unnorm)
 		new_weights=new_weights_unnorm/normalizer  #need to normalize new weights
 		
-		
-		#gradient updates for the proposal distribution parameters
-		lrate=1e-2
-		
-		loss=self.proposal_loss(s_pred, s_samps, xp, new_weights)
-		
-		gparams=T.grad(loss, self.meta_params, consider_constant=[s_pred, s_samps, xp, new_weights])
-		# constructs the update dictionary
-		for gparam, param, rel_lr in zip(gparams, self.meta_params, self.meta_rel_lrates):
-			updates[param] = T.cast(param - gparam*lrate*rel_lr,'float32')
-		
-		
 		updates[self.h_past]=T.cast(self.h_now,'float32')
 		updates[self.s_past]=T.cast(self.s_now,'float32')
 		
@@ -207,7 +186,46 @@ class SLmodel():
 		#return normalizer, energies_recentered, updates
 		#return h_samps, updates
 		return updates
+	
+	
+	def proposal_loss(self,C):
 		
+		#calculates how far off self.CCT is from the true posterior covariance
+		CCT=T.dot(C, C.T)
+		prod=T.dot(CCT, self.cov_inv)
+		diff=prod-T.eye(self.ns)
+		tot=T.sum(T.sum(diff**2))  #frobenius norm
+		
+		return tot
+	
+	
+	def prop_update_step(self, C_now, lr):
+		
+		loss=self.proposal_loss(C_now)
+		gr=T.grad(loss, C_now)
+		return [C_now-lr*gr]
+	
+	
+	def update_proposal_distrib(self, n_steps, lr):
+		
+		#does some gradient descent on self.C, so that self.CCT becomes
+		#closer to the true posterior covariance
+		C0=self.C
+		Cs, updates = theano.scan(fn=self.prop_update_step,
+									outputs_info=[C0],
+									non_sequences=[lr],
+									n_steps=n_steps)
+		
+		updates[self.C]=Cs[-1]
+		
+		loss=self.proposal_loss(Cs[-1])
+		
+		#updates={}
+		#updates[self.C]=self.prop_update_step(self.C,lr)
+		#loss=self.proposal_loss(self.C)
+		
+		return loss, updates
+	
 	
 	def get_prediction(self, s, h):
 		
@@ -236,42 +254,6 @@ class SLmodel():
 		return [s1_samp, h1_samp, s2_samp, h2_samp]
 	
 	
-	#def sample_posterior(self, n_samps):
-		
-		
-		#sp, updates = theano.scan(fn=self.get_prediction,
-									#outputs_info=[None],
-									#sequences=[self.s_past, self.h_past],
-									#n_steps=self.npcl)
-		
-		##sp should be np by ns
-		
-		
-		#[s1_samps, h1_samps, s2_samps, h2_samps], updates = theano.scan(fn=self.sample_joint,
-									#outputs_info=[None, None, None, None],
-									#non_sequences=[sp],
-									#n_steps=n_samps)
-		
-		#return [s1_samps, h1_samps, s2_samps, h2_samps]
-	
-	
-	def h_energy_step(self, s, h):
-		
-		#helper function for self.calc_mean_h_energy
-		
-		exp_A_i=T.reshape(T.sum(self.exp_A*T.reshape(h,(self.nh,1)),axis=0),(self.ns,1))
-		mu_i=T.reshape(T.sum(self.mu*T.reshape(h,(self.nh,1)),axis=0), (self.ns,1))
-		ln_Z_h_i=T.sum(self.ln_Z_h*T.reshape(h,(self.nh,1)))
-		ph_i=T.sum(self.ph*T.reshape(h,(self.nh,1)))
-		diff=T.reshape(T.reshape(s,(self.ns,1))-mu_i,(self.ns,1))
-		diff_dot_exp_A_i=diff*exp_A_i
-		gterm=-0.5*T.sum(T.sum(diff_dot_exp_A_i*diff))
-		energy=gterm+ln_Z_h_i+ph_i
-		
-		
-		return energy
-	
-	
 	def calc_mean_h_energy(self, s, h):
 		
 		#you give this function a set of samples of s and h,
@@ -280,7 +262,7 @@ class SLmodel():
 		
 		exp_terms=T.dot(s, self.A) + T.reshape(self.ph,(1,self.nh))  #np by nh
 		
-		energies=T.sum(h*exp_terms,axis=1) + T.log(T.sum(T.exp(exp_terms),axis=1)) #should be np by 1
+		energies=T.sum(h*exp_terms,axis=1) - T.log(T.sum(T.exp(exp_terms),axis=1)) #should be np by 1
 		
 		energy=T.mean(energies)
 		
@@ -327,14 +309,6 @@ class SLmodel():
 		for gparam, param, rel_lr in zip(gparams, self.params, self.rel_lrates):
 			#gnat=T.dot(param, T.dot(param.T,param))
 			updates[param] = T.cast(param + gparam*lrate*rel_lr,'float32')
-		
-		
-		#make sure W has unit-length columns
-		#new_W=updates[self.W]
-		#updates[self.W]=T.cast(new_W/T.sqrt(T.sum(new_W**2,axis=0)),'float32')
-		
-		#MIGHT NEED TO NORMALIZE A
-		
 		
 		return energy, updates
 		
@@ -392,222 +366,6 @@ class SLmodel():
 										n_steps=n_steps)
 		
 		return sp, xp, hs, updates
-
-'''
-
-nx=2
-ns=2
-nh=2
-npcl=20
-
-nsamps=10
-lrate=1e-3
-
-model=SCLmodel(nx, ns, nh, npcl, xvar=0.1)
-
-
-x=T.fvector()
-
-#norm, eng, ssmp, sprd, Wx, updates0=model.forward_filter_step(x)
-#norm, eng, updates0=model.forward_filter_step(x)
-#inference_step=theano.function([x],[norm,eng,ssmp,sprd,Wx],updates=updates0,allow_input_downcast=True)
-#inference_step=theano.function([x],[norm,eng],updates=updates0,allow_input_downcast=True)
-hsmps, updates0=model.forward_filter_step(x)
-inference_step=theano.function([x],hsmps,updates=updates0,allow_input_downcast=True)
-
-ess=model.get_ESS()
-get_ESS=theano.function([],ess)
-
-updates1=model.resample()
-resample=theano.function([],updates=updates1)
-
-x1=T.fvector(); x2=T.fvector()
-lr=T.fscalar(); nsmps=T.lscalar()
-
-nrg, updates2 = model.update_params(x1, x2, nsmps, lr)
-learn_step=theano.function([x1,x2,nsmps,lr],[nrg],updates=updates2,allow_input_downcast=True)
-
-nps=T.lscalar()
-sps, xps, hs, updates3 = model.simulate_forward(nps)
-predict=theano.function([nps],[sps,xps,hs],updates=updates3,allow_input_downcast=True)
-
-theta=0.2
-vec=np.ones(2)
-M1=np.asarray([[np.cos(theta),-np.sin(theta)],[np.sin(theta),np.cos(theta)]],dtype='float32')
-M2=np.asarray([[np.cos(theta/3.0),-np.sin(theta/3.0)],[np.sin(theta/3.0),np.cos(theta/3.0)]],dtype='float32')
-W=np.asarray(np.random.randn(2,2),dtype='float32')
-c=np.asarray(np.random.randn(2),dtype='float32')
-
-dt=0.05
-nt=100000
-
-
-x_hist=[]
-h_hist=[]
-v_hist=[]
-e_hist=[]
-s_hist=[]
-r_hist=[]
-l_hist=[]
-w_hist=[]
-
-resample_counter=0
-learn_counter=0
-
-for i in range(nt):
-	if vec[0]+np.random.randn(1)/100.0>0:
-		M=M1
-	else:
-		M=M2
-	vec=np.dot(M,vec)+np.random.randn(2)*0.01
-	x=np.dot(W,vec)+c+np.random.randn(2)*0.1
-	v_hist.append(vec)
-	x_hist.append(x)
-	
-	#normalizer,energies,ssamps,spreds,WTx=inference_step(vec)
-	#normalizer,energies=inference_step(x)
-	h_samps=inference_step(x)
-	
-	#pp.scatter(ssamps[:,0],ssamps[:,1],color='b')
-	#pp.scatter(spreds[:,0],spreds[:,1],color='r')
-	#pp.scatter(WTx[0],WTx[1],color='g')
-	
-	#pp.hist(energies,20)
-	#pp.show()
-	
-	#print h_samps
-	
-	ESS=get_ESS()
-	
-	learn_counter+=1
-	resample_counter+=1
-	
-	if resample_counter>0 and learn_counter>20:
-		
-		energy=learn_step(x_hist[-2],x_hist[-1],nsamps, lrate)
-		e_hist.append(energy)
-		learn_counter=0
-		l_hist.append(1)
-		lrate=lrate*0.9993094
-	else:
-		l_hist.append(0)
-	
-	if i%1000==0:	
-		#print normalizer
-		print ESS
-		print i
-		print model.M.get_value()
-		print model.W.get_value()
-		print model.A.get_value()
-		print model.mu.get_value()
-		print model.c.get_value()
-		print model.b.get_value()
-	if ESS<npcl/2:
-		resample()
-		resample_counter=0
-		r_hist.append(1)
-	else:
-		r_hist.append(0)
-	
-	s_hist.append(model.s_now.get_value())
-	w_hist.append(model.weights_now.get_value())
-	h_hist.append(model.h_now.get_value())
-	
-	if math.isnan(ESS):
-		print model.b.get_value()
-		print model.M.get_value()
-		print model.W.get_value()
-		break
-
-
-
-xact=[]
-
-npred=1000
-
-
-for i in range(npred):
-	if vec[0]+np.random.randn(1)/100.0>0:
-		M=M1
-	else:
-		M=M2
-	vec=np.dot(M,vec)+np.random.randn(2)*np.sqrt(0.0001)
-	x=np.dot(W,vec)+c+np.random.randn(2)*np.sqrt(0.01)
-	xact.append(x)
-
-xact=np.asarray(xact)
-
-spred, xpred, hsmps = predict(npred)
-
-
-
-s_hist=np.asarray(s_hist)
-w_hist=np.asarray(w_hist)
-h_hist=np.asarray(h_hist)
-s_av=np.mean(s_hist,axis=1)
-print s_hist.shape
-print h_hist.shape
-
-h_hist=h_hist*np.asarray([0,1])
-h_av=np.mean(h_hist,axis=2)
-h_av=np.mean(h_hist,axis=1)
-
-
-v_hist=np.asarray(v_hist)
-x_hist=np.asarray(x_hist)
-e_hist=np.asarray(e_hist)
-l_hist=np.asarray(l_hist)-.5
-r_hist=np.asarray(r_hist)-.5
-pp.plot(x_hist)
-pp.figure(2)
-pp.plot(v_hist)
-pp.figure(3)
-pp.plot(e_hist)
-pp.figure(4)
-pp.plot(s_av)
-#pp.plot(r_hist, 'r')
-#pp.plot(l_hist, 'k')
-
-pp.figure(5)
-for i in range(npcl):
-	pp.scatter(range(len(s_hist)),s_hist[:,i,0],color=zip(w_hist[:,i],np.zeros(len(w_hist)),1.0-w_hist[:,i]))
-
-pp.figure(6)
-for i in range(npcl):
-	pp.scatter(range(len(s_hist)),s_hist[:,i,1],color=zip(w_hist[:,i],np.zeros(len(w_hist)),1.0-w_hist[:,i]))
-	
-pp.figure(7)
-for i in range(npcl):
-	pp.scatter(range(len(s_hist)),s_hist[:,i,0],color=zip(np.ones(len(w_hist)),np.zeros(len(w_hist)),np.zeros(len(w_hist)),w_hist[:,i]))
-
-
-
-#pp.figure(6)
-#pp.plot(h_av)
-
-#pp.figure(7)
-#pp.plot(spred)
-
-#pp.figure(8)
-#pp.plot(xpred,'r')
-#pp.plot(xact,'b')
-
-
-
-#pp.figure(6)
-#for i in range(npcl):
-	#pp.scatter(range(len(s_hist)),s_hist[:,i,0],c='k',s=5)
-
-#pp.figure(5)
-#for i in range(npcl):
-	#pp.scatter(range(len(s_hist)),s_hist[:,i,1],color=zip(np.zeros(len(w_hist)),np.zeros(len(w_hist)),np.ones(len(w_hist)),w_hist[:,i]))
-
-
-pp.show()
-
-
-
-'''
 
 
 
