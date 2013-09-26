@@ -7,7 +7,7 @@ import sys
 sys.path.insert(0, '../SLmodel')
 sys.path.insert(0, '../simulators')
 
-from SLmodel_adaptive_prop_2 import SLmodel
+from SLmodel_mean_h import SLmodel
 
 import double_pendulum_world
 from double_pendulum_world import springworld as sim
@@ -27,16 +27,16 @@ def pink_noise(nsamps,ampbase,cutoff):
 	return out*ampbase
 
 
-nx=4
+nx=16
 ns=2
-nh=3
+nh=2
 npcl=20
 
-nsamps=5
-lrate=1e-4
+nsamps=10
+lrate=2e-5
 
 dt=0.05
-nt=200000
+nt=300000
 
 npred=1000
 
@@ -44,7 +44,7 @@ npred=1000
 
 x_hist=[]
 
-theta=0.1
+theta=0.2
 vec=np.ones(2)
 M1=np.asarray([[np.cos(theta),-np.sin(theta)],[np.sin(theta),np.cos(theta)]],dtype='float32')
 M2=np.asarray([[np.cos(theta/3.0),-np.sin(theta/3.0)],[np.sin(theta/3.0),np.cos(theta/3.0)]],dtype='float32')
@@ -146,7 +146,7 @@ s_hist=[]
 r_hist=[]
 l_hist=[]
 w_hist=[]
-ploss_hist=[]
+ploss_hist=[0.0]
 
 th=[]
 
@@ -169,9 +169,6 @@ for i in range(nt-1):
 	
 	#print h_samps
 	
-	if i%5==0:
-		pl=update_prop(4,1e-3)
-		ploss_hist.append(pl)
 	
 	ESS=get_ESS()
 	ess_hist.append(ESS)
@@ -182,8 +179,10 @@ for i in range(nt-1):
 		energy=learn_step(i,nsamps, lrate)
 		e_hist.append(energy)
 		learn_counter=0
+		pl=update_prop(15,1e-3)
+		ploss_hist.append(pl)
 		l_hist.append(1)
-		lrate=lrate*0.999
+		lrate=lrate*0.9997
 	else:
 		l_hist.append(0)
 	
